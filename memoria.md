@@ -5,9 +5,15 @@ t(exec) = 1s --> mu = K(cores)/t(exec)
 synchronous channel
 
 
-| Escenario | Protocolo | Resultado del Dial/envío | Tiempo |
-|---|---|---|---|
-| Cliente conecta antes de arrancar el servidor | TCP | Fallo | 315.024 µs |
-| Cliente conecta con el servidor ya arrancado | TCP | Éxito | 54.655 µs |
-| Cliente envía una letra y recibe la respuesta | UDP | Éxito | 326.383 µs |
+
+| Protocolo | Situación          | Máquina  | Tiempo(ms)|
+| --------- | ------------------ | -------- | ------ |
+| TCP       | servidor apagado   | misma    | 1.03  |
+| TCP       | servidor encendido | misma    | 0.742  |
+| TCP       | servidor apagado   | distinta | ...    |
+| TCP       | servidor encendido | distinta | ...    |
+| UDP       | ida + vuelta       | misma    | 0.200  |
+| UDP       | ida + vuelta       | distinta | ...    |
+
+
 
