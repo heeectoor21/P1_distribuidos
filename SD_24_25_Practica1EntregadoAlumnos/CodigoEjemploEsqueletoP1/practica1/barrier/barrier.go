@@ -1,9 +1,8 @@
 package main
 
-//HOLAAA
-
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -12,23 +11,14 @@ import (
 	"time"
 )
 
-// implementacion de barrera
-// cada proceso es cliente y servidor
-// un proceso notifica a n - 1 procesos que ha alcanzado la barrera
-// para pasar la barrera un proceso tiene que recibir n - 1 notificaciones
-
-// TCP/IP para comunicar los distintos procesos
-// Dos canales internos para poder comunicar las goroutines (en un mismo proceso)
-// Un semáforo para la sección crítica entre las gouroutines (en un mismo proceso)
-
-// lee fichero de direcciones linea a linea
+// readEndpoints lee del fichero las direcciones de todos los procesos de la
+// barrera. Cada línea contiene un endpoint en formato host:puerto.
 func readEndpoints(filename string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-
 	var endpoints []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -43,80 +33,108 @@ func readEndpoints(filename string) ([]string, error) {
 	return endpoints, nil
 }
 
-// se tiene n - 1 goroutines handleConection() -> se necesita un semaforo mutex para la exclusión mutua
-// seccion critica -> contador de notificaciones
-func handleConnection(conn net.Conn, barrierChan chan<- bool, received *map[string]bool, mu *sync.Mutex, n int) {
+// handleConnection registra la llegada de un proceso remoto a la barrera.
+// El mapa evita contar dos veces un mismo mensaje y el mutex protege el mapa
+// porque esta función se ejecuta en una goroutine por cada conexión.
+func handleConnection(
+	conn net.Conn,
+	barrierChan chan<- bool,
+	received *map[string]bool,
+	mu *sync.Mutex,
+	n int,
+) {
 	defer conn.Close()
 	buf := make([]byte, 1024)
-	_, err := conn.Read(buf)
+	bytesRead, err := conn.Read(buf)
 	if err != nil {
 		fmt.Println("Error reading from connection:", err)
 		return
 	}
-	msg := string(buf)
-	mu.Lock()												// IMPORTANTE
-	(*received)[msg] = true									// SECCIÓN CRÍTICA
-	fmt.Println("Received ", len(*received), " elements")	
+	msg := string(buf[:bytesRead])
+	mu.Lock()
+	(*received)[msg] = true
+	fmt.Println("Received", len(*received), "elements")
+	// Este proceso ya ha llegado localmente; por tanto, solo debe recibir
+	// mensajes de los otros n-1 procesos para poder liberar la barrera.
 	if len(*received) == n-1 {
 		barrierChan <- true
 	}
 	mu.Unlock()
 }
 
-// Get enpoints (IP adresse:port for each distributed process)
-// Prepara los datos
-// Ejecución: go run barrier.go endpoints.txt (fichero con direcciones) id (identificador del proceso)
+// getEndpoints valida los argumentos del proceso y obtiene sus endpoints.
+// lineNumber identifica la posición de este proceso dentro del fichero.
 func getEndpoints() ([]string, int, error) {
-    endpointsFile := os.Args[1]
-    var endpoints []string  // Por qué esta declaración ?
+	endpointsFile := os.Args[1]
+	var endpoints []string
 	lineNumber, err := strconv.Atoi(os.Args[2])
 	if err != nil || lineNumber < 1 {
-		fmt.Println("Invalid line number")
+		return nil, 0, errors.New("invalid line number")
 	} else if endpoints, err = readEndpoints(endpointsFile); err != nil {
-		    fmt.Println("Error reading endpoints:", err)
-	    } else if lineNumber > len(endpoints) {
-		        fmt.Printf("Line number %d out of range\n", lineNumber)
-		        err = errors.New("Line number out of range")
-	    }
-    }
-
-    return endpoints,lineNumber, err
+		fmt.Println("Error reading endpoints:", err)
+	} else if lineNumber > len(endpoints) {
+		fmt.Printf("Line number %d out of range\n", lineNumber)
+		err = errors.New("line number out of range")
+	}
+	return endpoints, lineNumber, err
 }
 
-// Función de servidor
-// Para tratar la notificación de un proceso
-func acceptAndHandleConnections(listener net.Listener, quitChannel chan bool, barrierChan chan bool, receivedMap *map[string]bool, mu *sync.Mutex)
- {
+// acceptAndHandleConnections acepta conexiones entrantes hasta que se recibe
+// la orden de detener el listener, delegando cada conexión a una goroutine.
+func acceptAndHandleConnections(
+	listener net.Listener,
+	quitChannel chan bool,
+	barrierChan chan bool,
+	receivedMap *map[string]bool,
+	mu *sync.Mutex,
+	n int,
+) {
 	for {
 		select {
 		case <-quitChannel:
 			fmt.Println("Stopping the listener...")
-			break
+			return
 		default:
 			conn, err := listener.Accept()
 			if err != nil {
 				fmt.Println("Error accepting connection:", err)
-				continue
+				return
 			}
-			go handleConnection(conn, barrierChan, &receivedMap, &mu, n)
+			// Cada proceso remoto abre una conexión independiente, por lo que
+			// atenderla en paralelo evita bloquear la recepción de las demás.
+			go handleConnection(
+				conn,
+				barrierChan,
+				receivedMap,
+				mu,
+				n,
+			)
 		}
 	}
 }
 
-// Para notificar a los n - 1 procesos
-// Se tiene n - 1 goroutines para no notificar de forma secuencial
-func notifyOtherDistributedProcesses(endPoints [] string, lineNumber int) {
-	for i, ep := range endpoints {
+// notifyOtherDistributedProcesses avisa a todos los procesos, excepto al
+// actual, de que este proceso ha alcanzado la barrera. Si un proceso todavía
+// no está escuchando, reintenta la conexión periódicamente.
+func notifyOtherDistributedProcesses(
+	endPoints []string,
+	lineNumber int,
+) {
+	for i, ep := range endPoints {
 		if i+1 != lineNumber {
 			go func(ep string) {
 				for {
+					// El listener del proceso remoto puede arrancar después que
+					// este proceso; por eso la conexión se reintenta hasta tener éxito.
 					conn, err := net.Dial("tcp", ep)
 					if err != nil {
 						fmt.Println("Error connecting to", ep, ":", err)
 						time.Sleep(1 * time.Second)
 						continue
 					}
-					_, err = conn.Write([]byte(strconv.Itoa(lineNumber)))
+					_, err = conn.Write(
+						[]byte(strconv.Itoa(lineNumber)),
+					)
 					if err != nil {
 						fmt.Println("Error sending message:", err)
 						conn.Close()
@@ -131,31 +149,50 @@ func notifyOtherDistributedProcesses(endPoints [] string, lineNumber int) {
 }
 
 func main() {
-    var listener net.Listener
-
+	var listener net.Listener
+	// Se necesitan el fichero de endpoints y el número de línea del proceso.
 	if len(os.Args) != 3 {
-		fmt.Println("Usage: go run main.go <endpoints_file> <line_number>")
-	} else if endPoints, lineNumber, err := getEndpoints(); err != nil {
-        // Get the endpoint for current process
-        localEndpoint := endPoints[lineNumber-1]
-	    if listener, err = net.Listen("tcp", localEndpoint); err != nil {
-		    fmt.Println("Error creating listener:", err)
-		} else {
-            fmt.Println("Listening on", localEndpoint)
-
-    // Barrier synchronization
-	var mu sync.Mutex							// Crea el mutex (semáforo)
-	quitChannel := make(chan bool)				// Canal para terminar
-	receivedMap := make(map[string]bool)		// Guardar que procesos han notificado 
-	barrierChan := make(chan bool)				// Canal para controlar la barrera
-
-	// Para recibir las notificaciones de los n - 1 procesos
-    go acceptAndHandleConnections(listener, quitChannel, barrierChan, &receivedMap, &mu)
-
-	// Para notificar a los n - 1 procesos
-    notifyOtherDistributedProcesses(endPoints, lineNumber)
-
-	fmt.Println("Waiting for all the processes to reach the barrier")
-
+		fmt.Println(
+			"Usage: go run main.go <endpoints_file> <line_number>",
+		)
+		return
+	}
+	endPoints, lineNumber, err := getEndpoints()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	localEndpoint := endPoints[lineNumber-1]
+	listener, err = net.Listen("tcp", localEndpoint)
+	if err != nil {
+		fmt.Println("Error creating listener:", err)
+		return
+	}
+	fmt.Println("Listening on", localEndpoint)
+	var mu sync.Mutex
+	quitChannel := make(chan bool)
+	receivedMap := make(map[string]bool)
+	barrierChan := make(chan bool)
+	// El listener queda atendiendo conexiones mientras el proceso principal
+	// notifica su llegada y espera a que lleguen los demás procesos.
+	go acceptAndHandleConnections(
+		listener,
+		quitChannel,
+		barrierChan,
+		&receivedMap,
+		&mu,
+		len(endPoints),
+	)
+	notifyOtherDistributedProcesses(
+		endPoints,
+		lineNumber,
+	)
+	fmt.Println(
+		"Waiting for all the processes to reach the barrier",
+	)
+	// La recepción del mensaje en barrierChan indica que han llegado todos
+	// los procesos remotos esperados.
+	<-barrierChan
+	fmt.Println("End Barrier")
 	listener.Close()
 }
