@@ -12,9 +12,9 @@ import (
 	"encoding/gob"
 	"log"
 	"net"
+	"os"
 	"practica1/com"
 	"time"
-	"os"
 )
 
 func sendEnd(endpoint string) {
@@ -116,7 +116,7 @@ func receiveReply(conn net.Conn, replayTimeChan chan com.TimeCommEvent) {
 
 func main() {
 	args := os.Args
-	if len(args) != 2{
+	if len(args) != 2 {
 		log.Println("Error: endpoint missing: go run client.go ip:port")
 		os.Exit(1)
 	}
