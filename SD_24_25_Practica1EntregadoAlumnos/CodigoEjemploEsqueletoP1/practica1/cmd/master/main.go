@@ -129,6 +129,12 @@ func receiveRequest(clientConn net.Conn) com.Request {
 func worker(tasks chan net.Conn, workerEndpoint string) {
 	for clientConn := range tasks {
 		request := receiveRequest(clientConn)
+
+		if request.Id == -1 {
+			clientConn.Close()
+			continue
+		}
+
 		reply := requestWorker(workerEndpoint, request)
 		replyClient(clientConn, reply)
 		clientConn.Close()
